@@ -376,7 +376,7 @@ class ConfigHelper:
                 "GPIO Component not available")
 
         def getgpio_wrapper(sec: str, opt: str) -> List(GpioOutputPin):
-            val = self.getlist(sec, opt)
+            val = self.getlist(opt, [])
             return gpio.setup_gpio_out(val, initial_value)
         return self._get_option(getgpio_wrapper, option, default,
                                 deprecate=deprecate)
