@@ -367,7 +367,7 @@ class ConfigHelper:
                    default: Union[Sentinel, _T] = Sentinel.MISSING,
                    initial_value: int = 0,
                    deprecate: bool = False
-                   ) -> Union[GpioOutputPin, _T]:
+                   ) -> Union[List(GpioOutputPin), _T]:
         try:
             gpio: GpioFactory = self.server.load_component(self, "gpio")
         except Exception:
@@ -375,8 +375,8 @@ class ConfigHelper:
                 f"Section [{self.section}], option '{option}', "
                 "GPIO Component not available")
 
-        def getgpio_wrapper(sec: str, opt: str) -> GpioOutputPin:
-            val = self.config.get(sec, opt)
+        def getgpio_wrapper(sec: str, opt: str) -> List(GpioOutputPin):
+            val = self.config.getlist(sec, opt)
             return gpio.setup_gpio_out(val, initial_value)
         return self._get_option(getgpio_wrapper, option, default,
                                 deprecate=deprecate)

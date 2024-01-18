@@ -51,18 +51,20 @@ class GpioFactory:
         self.server = config.get_server()
         self.reserved_gpios: Dict[str, GpioBase] = {}
 
-    def setup_gpio_out(self, pin_name: str, initial_value: int = 0) -> GpioOutputPin:
+    def setup_gpio_out(self, pin_names: [str], initial_value: int = 0) -> GpioOutputPin:
         initial_value = int(not not initial_value)
-        pparams = self._parse_pin(pin_name, initial_value)
-        gpio = self._request_gpio(pparams)
+        pparamss = [self._parse_pin(pin, initial_value) for pin in pin_names]
+        gpios = [self._request_gpio(pparams) for pparams in pparamss]
+        zipped = zip(gpios, pparamss)
         try:
-            gpio_out = GpioOutputPin(gpio, pparams)
+            gpio_out = [GpioOutputPin(gpio, pparams) for gpio, pparams in zipped]
         except Exception:
-            logging.exception("Error Instantiating GpioOutputPin")
+            logging.exception("Error Instantiating GpioOutputPin(s)")
             gpio.close()
             raise
-        full_name = pparams["full_name"]
-        self.reserved_gpios[full_name] = gpio_out
+        for gpio, pparams in zipped:
+            full_name = pparams["full_name"]
+            self.reserved_gpios[full_name] = gpio_out
         return gpio_out
 
     def register_gpio_event(

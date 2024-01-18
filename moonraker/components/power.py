@@ -536,7 +536,7 @@ class GpioDevice(PowerDevice):
         self.timer_handle: Optional[asyncio.TimerHandle] = None
         if initial_val is None:
             initial_val = int(self.initial_state or 0)
-        self.gpio_out = config.getgpioout('pin', initial_value=initial_val)
+        self.gpio_outs = config.getgpioout('pin', initial_value=initial_val)
 
     async def init_state(self) -> None:
         if self.initial_state is None:
@@ -553,7 +553,7 @@ class GpioDevice(PowerDevice):
             self.timer_handle.cancel()
             self.timer_handle = None
         try:
-            self.gpio_out.write(int(state == "on"))
+            for gpio_out in self.gpio_outs: gpio_out.write(int(state == "on"))
         except Exception:
             self.state = "error"
             msg = f"Error Toggling Device Power: {self.name}"
