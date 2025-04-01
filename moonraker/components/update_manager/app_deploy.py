@@ -10,13 +10,13 @@ import pathlib
 import hashlib
 import logging
 import re
-import distro
 import asyncio
 import importlib
 from .common import AppType, Channel
 from .base_deploy import BaseDeploy
 from ...utils import pip_utils
 from ...utils import json_wrapper as jsonw
+from ...utils.sysdeps_parser import SysDepsParser
 
 # Annotation imports
 from typing import (
@@ -31,47 +31,25 @@ from typing import (
 if TYPE_CHECKING:
     from ...confighelper import ConfigHelper
     from ..klippy_connection import KlippyConnection as Klippy
-    from .update_manager import CommandHelper
     from ..machine import Machine
     from ..file_manager.file_manager import FileManager
 
-MIN_PIP_VERSION = (23, 3, 2)
-
-SUPPORTED_CHANNELS = {
-    AppType.ZIP: [Channel.STABLE, Channel.BETA],
-    AppType.GIT_REPO: list(Channel)
-}
-TYPE_TO_CHANNEL = {
-    AppType.ZIP: Channel.BETA,
-    AppType.GIT_REPO: Channel.DEV
-}
-
-DISTRO_ALIASES = [distro.id()]
-DISTRO_ALIASES.extend(distro.like().split())
-
 class AppDeploy(BaseDeploy):
-    def __init__(
-            self, config: ConfigHelper, cmd_helper: CommandHelper, prefix: str
-    ) -> None:
-        super().__init__(config, cmd_helper, prefix=prefix)
+    def __init__(self, config: ConfigHelper, prefix: str) -> None:
+        super().__init__(config, prefix=prefix)
         self.config = config
-        type_choices = list(TYPE_TO_CHANNEL.keys())
-        self.type = AppType.from_string(config.get('type'))
-        if self.type not in type_choices:
-            str_types = [str(t) for t in type_choices]
-            raise config.error(
-                f"Section [{config.get_name()}], Option 'type: {self.type}': "
-                f"value must be one of the following choices: {str_types}"
-            )
-        self.channel = Channel.from_string(
-            config.get("channel", str(TYPE_TO_CHANNEL[self.type]))
+        type_choices = {str(t): t for t in AppType.valid_types()}
+        self.type = config.getchoice("type", type_choices)
+        channel_choices = {str(chnl): chnl for chnl in list(Channel)}
+        self.channel = config.getchoice(
+            "channel", channel_choices, str(self.type.default_channel)
         )
         self.channel_invalid: bool = False
-        if self.channel not in SUPPORTED_CHANNELS[self.type]:
-            str_channels = [str(c) for c in SUPPORTED_CHANNELS[self.type]]
+        if self.channel not in self.type.supported_channels:
+            str_channels = [str(c) for c in self.type.supported_channels]
             self.channel_invalid = True
             invalid_channel = self.channel
-            self.channel = TYPE_TO_CHANNEL[self.type]
+            self.channel = self.type.default_channel
             self.server.add_warning(
                 f"[{config.get_name()}]: Invalid value '{invalid_channel}' for "
                 f"option 'channel'. Type '{self.type}' supports the following "
@@ -89,48 +67,12 @@ class AppDeploy(BaseDeploy):
         self.system_deps_json: Optional[pathlib.Path] = None
         self.info_tags: List[str] = config.getlist("info_tags", [])
         self.managed_services: List[str] = []
-        svc_default = []
-        if config.getboolean("is_system_service", True):
-            svc_default.append(self.name)
-        svc_choices = [self.name, "klipper", "moonraker"]
-        services: List[str] = config.getlist(
-            "managed_services", svc_default, separator=None
-        )
-        if self.name in services:
-            machine: Machine = self.server.lookup_component("machine")
-            data_path: str = self.server.get_app_args()["data_path"]
-            asvc = pathlib.Path(data_path).joinpath("moonraker.asvc")
-            if not machine.is_service_allowed(self.name):
-                self.server.add_warning(
-                    f"[{config.get_name()}]: Moonraker is not permitted to "
-                    f"restart service '{self.name}'.  To enable management "
-                    f"of this service add {self.name} to the bottom of the "
-                    f"file {asvc}.  To disable management for this service "
-                    "set 'is_system_service: False' in the configuration "
-                    "for this section."
-                )
-                services.clear()
-        for svc in services:
-            if svc not in svc_choices:
-                raw = " ".join(services)
-                self.server.add_warning(
-                    f"[{config.get_name()}]: Option 'managed_services: {raw}' "
-                    f"contains an invalid value '{svc}'.  All values must be "
-                    f"one of the following choices: {svc_choices}"
-                )
-                break
-        for svc in svc_choices:
-            if svc in services and svc not in self.managed_services:
-                self.managed_services.append(svc)
-        logging.debug(
-            f"Extension {self.name} managed services: {self.managed_services}"
-        )
 
-    def _configure_path(self, config: ConfigHelper) -> None:
+    def _configure_path(self, config: ConfigHelper, reserve: bool = True) -> None:
         self.path = pathlib.Path(config.get('path')).expanduser().resolve()
         self._verify_path(config, 'path', self.path, check_file=False)
         if (
-            self.name not in ["moonraker", "klipper"]
+            reserve and self.name not in ["moonraker", "klipper"]
             and not self.path.joinpath(".writeable").is_file()
         ):
             fm: FileManager = self.server.lookup_component("file_manager")
@@ -139,7 +81,9 @@ class AppDeploy(BaseDeploy):
     def _configure_virtualenv(self, config: ConfigHelper) -> None:
         venv_path: Optional[pathlib.Path] = None
         if config.has_option("virtualenv"):
-            venv_path = pathlib.Path(config.get("virtualenv")).expanduser().resolve()
+            venv_path = pathlib.Path(config.get("virtualenv")).expanduser()
+            if not venv_path.is_absolute():
+                venv_path = self.path.joinpath(venv_path)
             self._verify_path(config, 'virtualenv', venv_path, check_file=False)
         elif config.has_option("env"):
             # Deprecated
@@ -184,17 +128,59 @@ class AppDeploy(BaseDeploy):
         if self.py_exec is not None:
             self.python_reqs = self.path.joinpath(config.get("requirements"))
             self._verify_path(config, 'requirements', self.python_reqs)
-        deps = config.get("system_dependencies", None)
-        if deps is not None:
-            self.system_deps_json = self.path.joinpath(deps).resolve()
-            self._verify_path(config, 'system_dependencies', self.system_deps_json)
-        else:
+        if not self._configure_sysdeps(config):
             # Fall back on deprecated "install_script" option if dependencies file
             # not present
             install_script = config.get('install_script', None)
             if install_script is not None:
                 self.install_script = self.path.joinpath(install_script).resolve()
                 self._verify_path(config, 'install_script', self.install_script)
+
+    def _configure_sysdeps(self, config: ConfigHelper) -> bool:
+        deps = config.get("system_dependencies", None)
+        if deps is not None:
+            self.system_deps_json = self.path.joinpath(deps).resolve()
+            self._verify_path(config, 'system_dependencies', self.system_deps_json)
+            return True
+        return False
+
+    def _configure_managed_services(self, config: ConfigHelper) -> None:
+        svc_default = []
+        if config.getboolean("is_system_service", True):
+            svc_default.append(self.name)
+        svc_choices = [self.name, "klipper", "moonraker"]
+        services: List[str] = config.getlist(
+            "managed_services", svc_default, separator=None
+        )
+        if self.name in services:
+            machine: Machine = self.server.lookup_component("machine")
+            data_path: str = self.server.get_app_args()["data_path"]
+            asvc = pathlib.Path(data_path).joinpath("moonraker.asvc")
+            if not machine.is_service_allowed(self.name):
+                self.server.add_warning(
+                    f"[{config.get_name()}]: Moonraker is not permitted to "
+                    f"restart service '{self.name}'.  To enable management "
+                    f"of this service add {self.name} to the bottom of the "
+                    f"file {asvc}.  To disable management for this service "
+                    "set 'is_system_service: False' in the configuration "
+                    "for this section."
+                )
+                services.clear()
+        for svc in services:
+            if svc not in svc_choices:
+                raw = " ".join(services)
+                self.server.add_warning(
+                    f"[{config.get_name()}]: Option 'managed_services: {raw}' "
+                    f"contains an invalid value '{svc}'.  All values must be "
+                    f"one of the following choices: {svc_choices}"
+                )
+                break
+        for svc in svc_choices:
+            if svc in services and svc not in self.managed_services:
+                self.managed_services.append(svc)
+        self.log_debug(
+            f"Managed services: {self.managed_services}"
+        )
 
     def _verify_path(
         self,
@@ -217,7 +203,6 @@ class AppDeploy(BaseDeploy):
 
     async def initialize(self) -> Dict[str, Any]:
         storage = await super().initialize()
-        self._is_valid = storage.get("is_valid", False)
         self.pip_version = tuple(storage.get("pip_version", []))
         if self.pip_version:
             ver_str = ".".join([str(part) for part in self.pip_version])
@@ -287,20 +272,8 @@ class AppDeploy(BaseDeploy):
             except Exception:
                 logging.exception(f"Error reading system deps: {deps_json}")
                 return []
-            for distro_id in DISTRO_ALIASES:
-                if distro_id in dep_info:
-                    if not dep_info[distro_id]:
-                        self.log_info(
-                            f"Dependency file '{deps_json.name}' contains an empty "
-                            f"package definition for linux distro '{distro_id}'"
-                        )
-                    return dep_info[distro_id]
-            else:
-                self.log_info(
-                    f"Dependency file '{deps_json.name}' has no package definition "
-                    f" for linux distro '{DISTRO_ALIASES[0]}'"
-                )
-                return []
+            parser = SysDepsParser()
+            return parser.parse_dependencies(dep_info)
         # Fall back on install script if configured
         if self.install_script is None:
             return []
@@ -314,7 +287,7 @@ class AppDeploy(BaseDeploy):
         except asyncio.CancelledError:
             raise
         except Exception:
-            logging.exception(f"Error reading install script: {deps_json}")
+            logging.exception(f"Error reading install script: {inst_path}")
             return []
         plines: List[str] = re.findall(r'PKGLIST="(.*)"', data)
         plines = [p.lstrip("${PKGLIST}").strip() for p in plines]
@@ -396,7 +369,17 @@ class AppDeploy(BaseDeploy):
         pip_exec = pip_utils.AsyncPipExecutor(
             self.pip_cmd, self.server, self.cmd_helper.notify_update_response
         )
-        # Check the current pip version
+        # Check and update the pip version
+        await self._update_pip(pip_exec)
+        self.notify_status("Updating python packages...")
+        try:
+            await pip_exec.install_packages(requirements, self.pip_env_vars)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.log_exc("Error updating python requirements")
+
+    async def _update_pip(self, pip_exec: pip_utils.AsyncPipExecutor) -> None:
         self.notify_status("Checking pip version...")
         try:
             pip_ver = await pip_exec.get_pip_version()
@@ -408,15 +391,61 @@ class AppDeploy(BaseDeploy):
                 )
                 await pip_exec.update_pip()
                 self.pip_version = pip_utils.MIN_PIP_VERSION
+            else:
+                self.notify_status("Pip version up to date")
         except asyncio.CancelledError:
             raise
         except Exception as e:
             self.notify_status(f"Pip Version Check Error: {e}")
             self.log_exc("Pip Version Check Error")
-        self.notify_status("Updating python packages...")
-        try:
-            await pip_exec.install_packages(requirements, self.pip_env_vars)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.log_exc("Error updating python requirements")
+
+    async def _collect_dependency_info(self) -> Dict[str, Any]:
+        pkg_deps = await self._read_system_dependencies()
+        pyreqs = await self._read_python_reqs()
+        npm_hash = await self._get_file_hash(self.npm_pkg_json)
+        logging.debug(
+            f"\nApplication {self.name}: Pre-update dependencies:\n"
+            f"Packages: {pkg_deps}\n"
+            f"Python Requirements: {pyreqs}"
+        )
+        return {
+            "system_packages": pkg_deps,
+            "python_modules": pyreqs,
+            "npm_hash": npm_hash
+        }
+
+    async def _update_dependencies(
+        self, dep_info: Dict[str, Any], force: bool = False
+    ) -> None:
+        packages = await self._read_system_dependencies()
+        modules = await self._read_python_reqs()
+        logging.debug(
+            f"\nApplication {self.name}: Post-update dependencies:\n"
+            f"Packages: {packages}\n"
+            f"Python Requirements: {modules}"
+        )
+        if not force:
+            packages = list(set(packages) - set(dep_info["system_packages"]))
+            modules = list(set(modules) - set(dep_info["python_modules"]))
+        logging.debug(
+            f"\nApplication {self.name}: Dependencies to install:\n"
+            f"Packages: {packages}\n"
+            f"Python Requirements: {modules}\n"
+            f"Force All: {force}"
+        )
+        if packages:
+            await self._install_packages(packages)
+        if modules:
+            await self._update_python_requirements(self.python_reqs or modules)
+        npm_hash: Optional[str] = dep_info["npm_hash"]
+        ret = await self._check_need_update(npm_hash, self.npm_pkg_json)
+        if force or ret:
+            if self.npm_pkg_json is not None:
+                self.notify_status("Updating Node Packages...")
+                try:
+                    await self.cmd_helper.run_cmd(
+                        "npm ci --only=prod", notify=True, timeout=600.,
+                        cwd=str(self.path)
+                    )
+                except Exception:
+                    self.notify_status("Node Package Update failed")

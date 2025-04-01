@@ -17,7 +17,7 @@ import logging.handlers
 import tempfile
 from queue import SimpleQueue
 from ..loghelper import LocalQueueHandler
-from ..common import APITransport, JobEvent, KlippyState
+from ..common import APITransport, JobEvent, KlippyState, UserInfo
 from ..utils import json_wrapper as jsonw
 
 from typing import (
@@ -440,9 +440,6 @@ class SimplyPrint(APITransport):
     def _update_intervals(self, intervals: Dict[str, Any]) -> None:
         for key, val in intervals.items():
             self.intervals[key] = val / 1000.
-        cur_ai_interval = self.intervals.get("ai", 0.)
-        if not cur_ai_interval:
-            self.webcam_stream.stop_ai()
         logging.debug(f"Intervals Updated: {self.intervals}")
 
     async def _announce_setup(self, short_id: str) -> None:
@@ -688,8 +685,6 @@ class SimplyPrint(APITransport):
             job_info["started"] = True
         self.layer_detect.start(metadata)
         self._send_job_event(job_info)
-        self.webcam_stream.reset_ai_scores()
-        self.webcam_stream.start_ai(120.)
 
     def _check_job_started(
         self,
@@ -717,13 +712,10 @@ class SimplyPrint(APITransport):
         self.send_sp("job_info", {"paused": True})
         self._update_state("paused")
         self.layer_detect.stop()
-        self.webcam_stream.stop_ai()
 
     def _on_print_resumed(self, *args) -> None:
         self._update_state("printing")
         self.layer_detect.resume()
-        self.webcam_stream.reset_ai_scores()
-        self.webcam_stream.start_ai(self.intervals["ai"])
 
     def _on_print_cancelled(self, *args) -> None:
         self._check_job_started(*args)
@@ -732,7 +724,6 @@ class SimplyPrint(APITransport):
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
-        self.webcam_stream.stop_ai()
 
     def _on_print_error(self, *args) -> None:
         self._check_job_started(*args)
@@ -745,7 +736,6 @@ class SimplyPrint(APITransport):
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
-        self.webcam_stream.stop_ai()
 
     def _on_print_complete(self, *args) -> None:
         self._check_job_started(*args)
@@ -754,13 +744,11 @@ class SimplyPrint(APITransport):
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
-        self.webcam_stream.stop_ai()
 
     def _on_print_standby(self, *args) -> None:
         self._update_state_from_klippy()
         self.cache.job_info = {}
         self.layer_detect.stop()
-        self.webcam_stream.stop_ai()
 
     def _on_pause_requested(self) -> None:
         self._print_request_event.set()
@@ -1121,7 +1109,6 @@ class SimplyPrint(APITransport):
 
     async def close(self):
         self.print_handler.cancel()
-        self.webcam_stream.stop_ai()
         self.amb_detect.stop()
         self.printer_info_timer.stop()
         self.ping_sp_timer.stop()
@@ -1289,9 +1276,9 @@ class LayerDetect:
 
     def start(self, metadata: Dict[str, Any]) -> None:
         self.reset()
-        lh: Optional[float] = metadata.get("layer_height")
-        flh: Optional[float] = metadata.get("first_layer_height", lh)
-        if lh is not None and flh is not None:
+        lh: float = metadata.get("layer_height", 0)
+        flh: float = metadata.get("first_layer_height", lh)
+        if lh > 0.000001 and flh > 0.000001:
             self._active = True
             self._layer_height = lh
             self._fl_height = flh
@@ -1323,7 +1310,6 @@ class LayerDetect:
 # go through the reverse proxy
 FALLBACK_URL = "http://127.0.0.1:8080/?action=snapshot"
 SP_SNAPSHOT_URL = "https://api.simplyprint.io/jobs/ReceiveSnapshot"
-SP_AI_URL = "https://ai.simplyprint.io/api/v2/infer"
 
 class WebcamStream:
     def __init__(
@@ -1337,10 +1323,6 @@ class WebcamStream:
         self.client: HttpClient = self.server.lookup_component("http_client")
         self.cam: Optional[WebCam] = None
         self._connected = False
-        self.ai_running = False
-        self.ai_task: Optional[asyncio.Task] = None
-        self.ai_scores: List[Any] = []
-        self.failed_ai_attempts = 0
 
     @property
     def connected(self) -> bool:
@@ -1416,72 +1398,6 @@ class WebcamStream:
                 return
             logging.exception("SimplyPrint WebCam Stream Error")
 
-    async def _send_ai_image(self, base_image: str) -> None:
-        interval = self.simplyprint.intervals["ai"]
-        headers = {"User-Agent": "Mozilla/5.0"}
-        data = {
-            "api_key": self.simplyprint.sp_info["printer_token"],
-            "image_array": base_image,
-            "interval": interval,
-            "printer_id": self.simplyprint.sp_info["printer_id"],
-            "settings": {
-                "buffer_percent": 80,
-                "confidence": 60,
-                "buffer_length": 16
-            },
-            "scores": self.ai_scores
-        }
-        resp = await self.client.post(
-            SP_AI_URL, body=data, headers=headers, enable_cache=False
-        )
-        resp.raise_for_status()
-        self.failed_ai_attempts = 0
-        resp_json = resp.json()
-        if isinstance(resp_json, dict):
-            self.ai_scores = resp_json.get("scores", self.ai_scores)
-            ai_result = resp_json.get("s1", [0, 0, 0])
-            self.simplyprint.send_sp("ai_resp", {"ai": ai_result})
-
-    async def _ai_stream(self, delay: float) -> None:
-        if delay:
-            await asyncio.sleep(delay)
-        while self.ai_running:
-            interval = self.simplyprint.intervals["ai"]
-            try:
-                img = await self.extract_image()
-                await self._send_ai_image(img)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.failed_ai_attempts += 1
-                if self.failed_ai_attempts == 1:
-                    logging.exception("SimplyPrint AI Stream Error")
-                elif not self.failed_ai_attempts % 10:
-                    logging.info(
-                        f"SimplyPrint: {self.failed_ai_attempts} consecutive "
-                        "AI failures"
-                    )
-                delay = min(120., self.failed_ai_attempts * 5.0)
-                interval = self.simplyprint.intervals["ai"] + delay
-            await asyncio.sleep(interval)
-
-    def reset_ai_scores(self):
-        self.ai_scores = []
-
-    def start_ai(self, delay: float = 0) -> None:
-        if self.ai_running:
-            self.stop_ai()
-        self.ai_running = True
-        self.ai_task = self.eventloop.create_task(self._ai_stream(delay))
-
-    def stop_ai(self) -> None:
-        if not self.ai_running:
-            return
-        self.ai_running = False
-        if self.ai_task is not None:
-            self.ai_task.cancel()
-            self.ai_task = None
-
 class PrintHandler:
     def __init__(self, simplyprint: SimplyPrint) -> None:
         self.simplyprint = simplyprint
@@ -1493,6 +1409,7 @@ class PrintHandler:
         self.download_progress: int = -1
         self.pending_file: str = ""
         self.last_started: str = ""
+        self.sp_user = UserInfo("SimplyPrint", "")
 
     def download_file(self, url: str, start: bool):
         coro = self._download_sp_file(url, start)
@@ -1598,7 +1515,7 @@ class PrintHandler:
         kapi: KlippyAPI = self.server.lookup_component("klippy_apis")
         data = {"state": "started"}
         try:
-            await kapi.start_print(pending)
+            await kapi.start_print(pending, user=self.sp_user)
         except Exception:
             logging.exception("Print Failed to start")
             data["state"] = "error"

@@ -236,7 +236,14 @@ class Announcements:
             "feed": feed
         }
         self.entry_mgr.add_entry(entry)
+        self.eventloop.create_task(self._notify_internal())
         return entry
+
+    async def _notify_internal(self) -> None:
+        entries = await self.entry_mgr.list_entries()
+        self.server.send_event(
+            "announcements:entries_updated", {"entries": entries}
+        )
 
     async def remove_announcement(self, entry_id: str) -> None:
         ret = await self.entry_mgr.remove_entry(entry_id)
@@ -415,9 +422,13 @@ class RssFeed:
         self.etag: Optional[str] = None
         self.dev_xml_path: Optional[pathlib.Path] = None
         if dev_mode:
-            res_dir = pathlib.Path(__file__).parent.parent.parent.resolve()
-            res_path = res_dir.joinpath(".devel/announcement_xml")
-            self.dev_xml_path = res_path.joinpath(self.xml_file)
+            data_path = pathlib.Path(self.server.get_app_arg("data_path"))
+            dev_folder = data_path.joinpath("development/announcements")
+            dev_folder.mkdir(parents=True, exist_ok=True)
+            self.dev_xml_path = dev_folder.joinpath(self.xml_file)
+            logging.info(
+                f"Announcement Feed {name}: Dev XML path set to {self.dev_xml_path}"
+            )
 
     async def initialize(self) -> None:
         self.etag = await self.database.get_item(

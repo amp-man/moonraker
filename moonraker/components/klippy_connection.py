@@ -49,11 +49,19 @@ RESERVED_ENDPOINTS = [
     "register_remote_method",
 ]
 
+# Items to exclude from the subscription cache.  They never change and can be
+# quite large.
+CACHE_EXCLUSIONS = {
+    "configfile": ["config", "settings"]
+}
+
 INIT_TIME = .25
 LOG_ATTEMPT_INTERVAL = int(2. / INIT_TIME + .5)
 MAX_LOG_ATTEMPTS = 10 * LOG_ATTEMPT_INTERVAL
 UNIX_BUFFER_LIMIT = 20 * 1024 * 1024
 SVC_INFO_KEY = "klippy_connection.service_info"
+SRC_PATH_KEY = "klippy_connection.path"
+PY_EXEC_KEY = "klippy_connection.executable"
 
 class KlippyConnection:
     def __init__(self, config: ConfigHelper) -> None:
@@ -78,6 +86,8 @@ class KlippyConnection:
         self._missing_reqs: Set[str] = set()
         self._peer_cred: Dict[str, int] = {}
         self._service_info: Dict[str, Any] = {}
+        self._path = pathlib.Path("~/klipper").expanduser()
+        self._executable = pathlib.Path("~/klippy-env/bin/python").expanduser()
         self.init_attempts: int = 0
         self._state: KlippyState = KlippyState.DISCONNECTED
         self._state.set_message("Klippy Disconnected")
@@ -132,10 +142,25 @@ class KlippyConnection:
         unit_name = svc_info.get("unit_name", "klipper.service")
         return unit_name.split(".", 1)[0]
 
+    @property
+    def path(self) -> pathlib.Path:
+        return self._path
+
+    @property
+    def executable(self) -> pathlib.Path:
+        return self._executable
+
+    def load_saved_state(self) -> None:
+        db: Database = self.server.lookup_component("database")
+        sync_provider = db.get_provider_wrapper()
+        kc_info: Dict[str, Any]
+        kc_info = sync_provider.get_item("moonraker", "klippy_connection", {})
+        self._path = pathlib.Path(kc_info.get("path", str(self._path)))
+        self._executable = pathlib.Path(kc_info.get("executable", str(self.executable)))
+        self._service_info = kc_info.get("service_info", {})
+
     async def component_init(self) -> None:
-        db: Database = self.server.lookup_component('database')
         machine: Machine = self.server.lookup_component("machine")
-        self._service_info = await db.get_item("moonraker", SVC_INFO_KEY, {})
         if self._service_info:
             machine.log_service_info(self._service_info)
 
@@ -260,7 +285,7 @@ class KlippyConnection:
             fut.set_result(self.is_connected())
             return fut
         self.connection_task = self.event_loop.create_task(self._do_connect())
-        return self.connection_task
+        return self.connection_task  # type: ignore
 
     async def _do_connect(self) -> bool:
         async with self.connection_mutex:
@@ -290,7 +315,7 @@ class KlippyConnection:
                 self.writer = writer
                 if self._get_peer_credentials(writer):
                     await self._get_service_info(self._peer_cred["process_id"])
-            self.event_loop.create_task(self._read_stream(reader))
+                self.event_loop.create_task(self._read_stream(reader))
             return await self._init_klippy_connection()
 
     async def open_klippy_connection(
@@ -323,6 +348,19 @@ class KlippyConnection:
             db.insert_item("moonraker", SVC_INFO_KEY, svc_info)
             self._service_info = svc_info
             machine.log_service_info(svc_info)
+
+    def _save_path_info(self) -> None:
+        kpath = pathlib.Path(self._klippy_info["klipper_path"])
+        kexec = pathlib.Path(self._klippy_info["python_path"])
+        db: Database = self.server.lookup_component("database")
+        if kpath != self.path:
+            self._path = kpath
+            db.insert_item("moonraker", SRC_PATH_KEY, str(kpath))
+            logging.info(f"Updated Stored Klipper Source Path: {kpath}")
+        if kexec != self.executable:
+            self._executable = kexec
+            db.insert_item("moonraker", PY_EXEC_KEY, str(kexec))
+            logging.info(f"Updated Stored Klipper Python Path: {kexec}")
 
     async def _init_klippy_connection(self) -> bool:
         self._klippy_identified = False
@@ -411,6 +449,7 @@ class KlippyConnection:
             return
         if send_id:
             self._klippy_identified = True
+            self._save_path_info()
             await self.server.send_event("server:klippy_identified")
             # Request initial endpoints to register info, emergency stop APIs
             await self._request_endpoints()
@@ -585,17 +624,9 @@ class KlippyConnection:
                 raise self.server.error(
                     "No connection associated with subscription request"
                 )
+            # if the connection has an existing subscription pop it off
+            self.subscriptions.pop(conn, None)
             requested_sub: Subscription = args.get('objects', {})
-            if self.server.is_verbose_enabled() and "configfile" in requested_sub:
-                cfg_sub = requested_sub["configfile"]
-                if (
-                    cfg_sub is None or "config" in cfg_sub or "settings" in cfg_sub
-                ):
-                    logging.debug(
-                        f"Detected 'configfile: {cfg_sub}' subscription.  The "
-                        "'config' and 'status' fields in this object do not change "
-                        "and substantially increase cache size."
-                    )
             all_subs: Subscription = dict(requested_sub)
             # Build the subscription request from a superset of all client subscriptions
             for sub in self.subscriptions.values():
@@ -627,7 +658,23 @@ class KlippyConnection:
                             continue
                         if value != cached_status[field_name]:
                             status_diff.setdefault(obj, {})[field_name] = value
-                self.subscription_cache[obj] = fields
+                if obj in CACHE_EXCLUSIONS:
+                    # Make a shallow copy so we can pop off fields we want to
+                    # exclude from the cache without modifying the return value
+                    fields_to_cache = dict(fields)
+                    removed: List[str] = []
+                    for excluded_field in CACHE_EXCLUSIONS[obj]:
+                        if excluded_field in fields_to_cache:
+                            removed.append(excluded_field)
+                            del fields_to_cache[excluded_field]
+                    if removed:
+                        logging.debug(
+                            "Removed excluded fields from subscription cache: "
+                            f"{obj}: {removed}"
+                        )
+                    self.subscription_cache[obj] = fields_to_cache
+                else:
+                    self.subscription_cache[obj] = fields
                 # Prune Response
                 if obj in requested_sub:
                     valid_fields = requested_sub[obj]
@@ -650,7 +697,8 @@ class KlippyConnection:
                 if obj_name not in all_status:
                     del self.subscription_cache[obj_name]
             result['status'] = pruned_status
-            self.subscriptions[conn] = requested_sub
+            if requested_sub:
+                self.subscriptions[conn] = requested_sub
             return result
 
     async def _request_standard(
